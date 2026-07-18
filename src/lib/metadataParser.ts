@@ -372,12 +372,62 @@ function parseAiff(buf: Uint8Array, fileSize: number): Meta {
   return meta;
 }
 
+// PERF FIX (slow import of non-fast-start M4A/AAC libraries): finding the
+// 'moov' atom used to mean reading the *entire* file into memory
+// (file.arrayBuffer()) whenever it wasn't within the first 768KB — see the
+// old comment on the m4a branch below. For a desktop library of multi-MB
+// (or lossless-sized) M4A files with moov at the end, that meant copying
+// the whole audio payload into memory (many GB across a real library) just
+// to reach a metadata atom that's typically a few KB to a few hundred KB.
+// That work happens inside the background worker, so the UI stayed
+// responsive throughout -- but it dominated total wall-clock import time,
+// especially for libraries produced by ffmpeg/DAWs without
+// `-movflags +faststart`.
+//
+// MP4/M4A's top-level structure is a flat sequence of boxes
+// (ftyp/free/mdat/moov/...), each starting with an 8-byte header (4-byte
+// size + 4-byte type; size 1 means a 64-bit size follows in the next 8
+// bytes, size 0 means "extends to EOF"). Walking that list only requires
+// reading each box's header, not its content -- so we can skip straight
+// over a multi-GB 'mdat' box with a single 16-byte read, and only read the
+// full byte range of the *one* box we actually want ('moov') once we've
+// located it. This turns a full-file read into a handful of tiny reads
+// plus one read sized to just the metadata atom.
+async function findTopLevelBox(file: File, name: string): Promise<{ start: number; size: number } | null> {
+  let pos = 0;
+  const fileSize = file.size;
+  // Real files have a handful of top-level boxes (ftyp, free, mdat, moov,
+  // ...); this cap just guards against a malformed/adversarial file sending
+  // us into a long loop of tiny reads.
+  const MAX_BOXES = 10000;
+  for (let i = 0; i < MAX_BOXES && pos + 8 <= fileSize; i++) {
+    const header = new Uint8Array(await file.slice(pos, Math.min(pos + 16, fileSize)).arrayBuffer());
+    if (header.length < 8) break;
+    let size = u32be(header, 0);
+    const type = lstr(header, 4, 4);
+    let headerLen = 8;
+    if (size === 1) {
+      if (header.length < 16) break;
+      const hi = u32be(header, 8);
+      const lo = u32be(header, 12);
+      size = hi * Math.pow(2, 32) + lo;
+      headerLen = 16;
+    } else if (size === 0) {
+      size = fileSize - pos;
+    }
+    if (size < headerLen || pos + size > fileSize) break; // malformed box
+    if (type === name) return { start: pos, size };
+    pos += size;
+  }
+  return null;
+}
+
 /**
  * Extracts title/artist/album/duration/bitrate/embedded-art from an audio
  * file. Reads only the first 768KB (plus, for Ogg, a small tail chunk) up
  * front since that covers the metadata for the overwhelming majority of
- * files — full-file reads only happen as a fallback (see the .m4a/.aac case)
- * so import stays fast on large libraries.
+ * files — full-file reads only happen as a last-resort fallback so import
+ * stays fast on large libraries.
  */
 export async function extractMeta(file: File): Promise<Meta> {
   try {
@@ -453,15 +503,23 @@ export async function extractMeta(file: File): Promise<Meta> {
       // libraries with longer, non-optimized files.
       //
       // Fix: try the head chunk first (cheap, and correct for the common
-      // fast-start case), and only fall back to reading the entire file if
-      // that didn't find a 'moov' box.
+      // fast-start case). If that didn't find a 'moov' box, don't fall back
+      // to reading the whole file — walk the top-level box headers (a
+      // handful of tiny reads) to find exactly where 'moov' lives, then
+      // read only that atom. This is what made import slow for desktop
+      // libraries: a multi-hundred-MB file no longer means a
+      // multi-hundred-MB read just to reach a metadata atom that's usually
+      // well under 1MB.
       const headMeta = parseM4a(headBuf, file.size);
       if (headMeta.artData || (headMeta.title && headMeta.artist)) return headMeta;
       if (file.size <= headBuf.length) return headMeta; // already read the whole file
       try {
-        const fullBuf = new Uint8Array(await file.arrayBuffer());
-        const fullMeta = parseM4a(fullBuf, file.size);
-        if (Object.keys(fullMeta).length > 0) return fullMeta;
+        const moovBox = await findTopLevelBox(file, 'moov');
+        if (moovBox) {
+          const moovBuf = new Uint8Array(await file.slice(moovBox.start, moovBox.start + moovBox.size).arrayBuffer());
+          const moovMeta = parseM4a(moovBuf, file.size);
+          if (Object.keys(moovMeta).length > 0) return moovMeta;
+        }
       } catch (e) {
         console.warn(`Album art: failed to re-scan "${file.name}" for a trailing moov atom`, e);
       }
