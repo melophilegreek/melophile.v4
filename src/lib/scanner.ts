@@ -67,15 +67,24 @@ function buildFolderArtIndex(allFiles: File[]): Map<string, File> {
 // the pool instead of being split into fixed-size chunks up front.
 const POOL_SIZE = Math.max(2, Math.min(navigator.hardwareConcurrency || 4, 8));
 
-// Batches now flush in the background (see flushPromises below) instead of
-// blocking per-file progress, so the main cost of a *larger* batch size is
-// no longer transaction overhead -- it's the size of the one leftover batch
-// that's still visible to the user as "Saving to library..." after every
-// file has been parsed. Keeping this smaller shrinks that worst-case wait
-// (previously up to 49 full audio files' worth of write time with zero
-// batching benefit left to lose, since transactions were already amortized
-// well below this size).
-const DB_BATCH_SIZE = 20;
+// Batches flush in the background (see flushPromises below) instead of
+// blocking per-file progress, so a larger batch size doesn't cost a visible
+// "stuck" wait at the end -- flushBatch() keeps nudging `saved` forward as
+// each batch lands, so the progress bar keeps moving regardless of batch
+// size (see the `finalizing` progress report in flushBatch below).
+//
+// PERF (large-folder import time): with that constraint gone, a *bigger*
+// batch is strictly better up to a point -- each flushBatch() call opens one
+// IndexedDB transaction, and transaction setup/commit has real fixed
+// overhead per call (not just per byte written), separate from the actual
+// blob-write time. At the old size of 20, a 1000-song import fired 50
+// separate transactions; each one's fixed overhead was pure waste on top of
+// the unavoidable time spent physically writing audio bytes to disk. Raising
+// this to 200 cuts that to ~5 transactions for the same import while still
+// keeping each individual transaction's audio-data payload (a few hundred
+// MB at most for a typical library) well within what IndexedDB handles
+// comfortably in one commit.
+const DB_BATCH_SIZE = 200;
 
 export async function importFiles(
   files: File[],
